@@ -33,8 +33,8 @@ async function reconcilePortfolio(delphi: Delphi): Promise<void> {
 }
 
 /**
- * When cash is too low to punch new trades, sell positions we've lost conviction
- * on so capital can rotate into fresher edges.
+ * Free cash only from truly weak holdings (edge ≤ 0 or conviction collapsed).
+ * Never mass-sell "non top-3" positives — that thrash burned spread on Jaguars/Mississippi.
  */
 async function rotateWeakPositions(delphi: Delphi, markets: Awaited<ReturnType<Delphi["listOpenMarkets"]>>): Promise<number> {
   const mark = await delphi.bankrollMark();
@@ -45,58 +45,95 @@ async function rotateWeakPositions(delphi: Delphi, markets: Awaited<ReturnType<D
   if (open.length === 0) return 0;
 
   const byAddress = new Map(markets.map((m) => [m.address.toLowerCase(), m]));
-  let freed = 0;
+  type Ranked = {
+    market: (typeof markets)[number];
+    pos: (typeof open)[number];
+    ourProb: number;
+    edge: number;
+  };
+  const weakOnes: Ranked[] = [];
 
   for (const pos of open) {
     const market = byAddress.get(pos.market.toLowerCase());
     if (!market) continue;
     try {
       const estimate = await estimateMarket(market);
+      // No live read → HOLD. Missing estimate used to look like "0% conviction" and we sold winners.
       if (!estimate) continue;
+      if (estimate.source === "deterministic" || estimate.source === "facts") continue;
       const ourProb = estimate.probs[pos.outcomeIdx] ?? 0;
       const mktProb = market.impliedProbs[pos.outcomeIdx] ?? 0;
       const edge = ourProb - mktProb;
-      const shouldSell = edge <= CONFIG.rotateSellEdge || ourProb <= CONFIG.rotateSellMaxProb;
-      if (!shouldSell) continue;
+      const weak = edge <= CONFIG.rotateSellEdge || ourProb <= CONFIG.rotateSellMaxProb;
+      if (weak) weakOnes.push({ market, pos, ourProb, edge });
+    } catch (err) {
+      journal("error", { where: "rotateWeakPositions.score", market: pos.market, err: String((err as Error).message).slice(0, 200) });
+    }
+  }
 
+  // Dump worst first, at most one (or configured) per scan — stop the churn.
+  weakOnes.sort((a, b) => a.edge - b.edge);
+  const toSell = weakOnes.slice(0, CONFIG.maxSellsPerScan);
+
+  let freed = 0;
+  for (const r of toSell) {
+    try {
       if (CONFIG.dryRun) {
         journal("decision", {
-          note: "rotate would sell",
-          market: market.address,
-          outcomeIdx: pos.outcomeIdx,
-          ourProb,
-          edge,
-          shares: pos.shares.toString(),
+          note: "rotate would sell weak only",
+          market: r.market.address,
+          outcomeIdx: r.pos.outcomeIdx,
+          ourProb: r.ourProb,
+          edge: r.edge,
         });
         continue;
       }
-
-      const { transactionHash, tokensOut } = await delphi.sellShares(pos.market as Address, pos.outcomeIdx, pos.shares);
+      const { transactionHash, tokensOut } = await delphi.sellShares(
+        r.pos.market as Address,
+        r.pos.outcomeIdx,
+        r.pos.shares,
+      );
       const amount = tokensToNumber(tokensOut);
       freed += amount;
+      noteSold(r.market.address);
       journal("trade", {
         action: "sell",
-        market: market.address,
-        question: market.question.slice(0, 140),
-        outcome: market.outcomes[pos.outcomeIdx],
-        outcomeIdx: pos.outcomeIdx,
-        ourProb,
-        edge,
+        market: r.market.address,
+        question: r.market.question.slice(0, 140),
+        outcome: r.market.outcomes[r.pos.outcomeIdx],
+        outcomeIdx: r.pos.outcomeIdx,
+        ourProb: r.ourProb,
+        edge: r.edge,
         tokensOut: amount,
         transactionHash,
-        reason: edge <= CONFIG.rotateSellEdge ? "edge flipped/weak" : "conviction collapsed",
+        reason: "weak edge / low conviction — free cash",
       });
       await notifyDiscord(
-        `Karve SOLD (rotate): "${market.question.slice(0, 100)}" → ${market.outcomes[pos.outcomeIdx]} ` +
-        `(+${amount.toFixed(1)} TST, edge ${(edge * 100).toFixed(1)}%)`,
+        `Karve SOLD (weak only): "${r.market.question.slice(0, 100)}" → ${r.market.outcomes[r.pos.outcomeIdx]} ` +
+        `(+${amount.toFixed(1)} TST, edge ${(r.edge * 100).toFixed(1)}%)`,
       );
     } catch (err) {
-      journal("error", { where: "rotateWeakPositions", market: pos.market, err: String((err as Error).message).slice(0, 300) });
+      journal("error", { where: "rotateWeakPositions.sell", market: r.pos.market, err: String((err as Error).message).slice(0, 300) });
     }
   }
 
   if (freed > 0) await reconcilePortfolio(delphi);
   return freed;
+}
+
+/** Markets we sold recently — block immediate rebuy (anti wash-trade). */
+const recentlySold = new Map<string, number>();
+function noteSold(market: string): void {
+  recentlySold.set(market.toLowerCase(), Date.now());
+}
+function isInSellCooldown(market: string): boolean {
+  const at = recentlySold.get(market.toLowerCase());
+  if (at === undefined) return false;
+  if (Date.now() - at >= CONFIG.sellRebuyCooldownMs) {
+    recentlySold.delete(market.toLowerCase());
+    return false;
+  }
+  return true;
 }
 
 /** In dry-run no position is recorded, so remember session decisions to avoid re-logging the same trade every scan. */
@@ -108,7 +145,13 @@ async function scanCycle(delphi: Delphi): Promise<void> {
   await reconcilePortfolio(delphi);
 
   let mark = await delphi.bankrollMark();
-  const markets = await delphi.listOpenMarkets();
+  const marketsRaw = await delphi.listOpenMarkets();
+  // Trade soonest-resolving markets first while cash is scarce.
+  const markets = [...marketsRaw].sort((a, b) => {
+    const ta = (a.resolvesAt ?? a.settlesAt)?.getTime() ?? Number.POSITIVE_INFINITY;
+    const tb = (b.resolvesAt ?? b.settlesAt)?.getTime() ?? Number.POSITIVE_INFINITY;
+    return ta - tb;
+  });
 
   // Free capital from weak holdings when we're cash-starved.
   const rotated = await rotateWeakPositions(delphi, markets);
@@ -136,6 +179,10 @@ async function scanCycle(delphi: Delphi): Promise<void> {
 
   for (const market of markets) {
     try {
+      if (isInSellCooldown(market.address)) {
+        journal("skip", { market: market.address, question: market.question.slice(0, 140), reason: "sell-rebuy cooldown (anti-thrash)" });
+        continue;
+      }
       const estimate = await estimateMarket(market);
       if (!estimate) continue;
       evaluated++;
